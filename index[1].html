@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EVE 合同猎手（两阶段估值 · 近N分钟 · 价格预筛 · 去重修复）</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div id="root" class="min-h-screen"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    const LS_KEY = "eve_contract_proxy_base";
+    const DEFAULT_PROXY = localStorage.getItem(LS_KEY) || "";
+    const normalizeBase = (s) => (s || "").replace(/\/+$/,"");
+
+    const JITA_REGION = 10000002;
+    const DEFAULT_THRESHOLD_PCT = 20;
+    const DEFAULT_MIN_PROFIT = 10_000_000;
+    const DEFAULT_MIN_VALUE  = 500_000_000;
+    const DEFAULT_SCAN_PAGES = 1;
+    const DEFAULT_ALERT_PROFIT = 200_000_000;
+    const DEFAULT_POLL_SECONDS = 120;
+    const DEFAULT_RECENT_DAYS = 7;
+    const DEFAULT_MIN_CONTRACT_PRICE = 200_000_000;
+    const DEFAULT_RECENT_MINUTES = 10;
+
+    const COMMON_REGIONS = [
+      { id: 10000002, name: "The Forge (Jita)" },
+      { id: 10000043, name: "Domain (Amarr)" },
+      { id: 10000032, name: "Sinq Laison (Dodixie)" },
+      { id: 10000042, name: "Metropolis (Hek)" },
+      { id: 10000016, name: "Lonetrek" },
+      { id: 10000033, name: "The Citadel" },
+      { id: 10000030, name: "Heimatar" },
+      { id: 10000044, name: "Tash-Murkon" },
+      { id: 10000037, name: "Everyshore" },
+      { id: 10000064, name: "Essence" },
+      { id: 10000060, name: "Delve" },
+      { id: 10000058, name: "Fountain" },
+      { id: 10000046, name: "Verge Vendor" },
+      { id: 10000003, name: "Vale of the Silent" },
+    ];
+
+    function App() {
+      const [proxyBase, setProxyBase] = useState(DEFAULT_PROXY);
+      const [thresholdPct, setThresholdPct] = useState(DEFAULT_THRESHOLD_PCT);
+      const [minProfit, setMinProfit] = useState(DEFAULT_MIN_PROFIT);
+      const [minValue, setMinValue] = useState(DEFAULT_MIN_VALUE);
+      const [minContractPrice, setMinContractPrice] = useState(DEFAULT_MIN_CONTRACT_PRICE);
+      const [scanPages, setScanPages] = useState(DEFAULT_SCAN_PAGES);
+      const [logs, setLogs] = useState([]);
+      const [error, setError] = useState("");
+      const [testing, setTesting] = useState(false);
+      const [testOk, setTestOk] = useState(null);
+      const [excludeBlueprints, setExcludeBlueprints] = useState(true);
+
+      const [scope, setScope] = useState("single");
+      const [singleRegion, setSingleRegion] = useState(10000002);
+      const [selectedRegionIds, setSelectedRegionIds] = useState(new Set([10000002]));
+      const [customRegionInput, setCustomRegionInput] = useState("");
+
+      // 去重核心：rowsByRegion 存数组，但维护 rowsIndexByRegion: region -> Map(cid -> idx)
+      const [rowsByRegion, setRowsByRegion] = useState(new Map());
+      const rowsIndexByRegionRef = useRef(new Map()); // regionId -> Map(cid -> index)
+      const globalSeenCidsRef = useRef(new Set()); // 跨轮询全局去重（显示层面）
+
+      const [regionNameCache, setRegionNameCache] = useState(new Map());
+
+      const [alertProfit, setAlertProfit] = useState(DEFAULT_ALERT_PROFIT);
+      const [pollSeconds, setPollSeconds] = useState(DEFAULT_POLL_SECONDS);
+      const [autoRun, setAutoRun] = useState(false);
+      const [useNotify, setUseNotify] = useState(true);
+      const [useSound, setUseSound] = useState(true);
+      const [notifyOnce, setNotifyOnce] = useState(true);
+      const [instantAppend, setInstantAppend] = useState(true);
+      const seenAlertRef = useRef(new Set());
+      const pollTimerRef = useRef(null);
+      const audioRef = useRef(null);
+
+      const [onlyRecentDays, setOnlyRecentDays] = useState(false);
+      const [recentDays, setRecentDays] = useState(DEFAULT_RECENT_DAYS);
+      const [onlyRecentMinutes, setOnlyRecentMinutes] = useState(true);
+      const [recentMinutes, setRecentMinutes] = useState(DEFAULT_RECENT_MINUTES);
+
+      const [twoStage, setTwoStage] = useState(true);
+
+      const typeNameCacheRef = useRef(new Map());
+      const jitaBuyPriceCacheRef = useRef(new Map());
+      const avgPriceMapRef = useRef(null);
+      const charNameCacheRef = useRef(new Map());
+      const corpNameCacheRef = useRef(new Map());
+
+      const logPush = (s) => {
+        const time = new Date().toLocaleTimeString();
+        setLogs(prev => [`[${time}] ${s}`, ...prev].slice(0, 600));
+      };
+
+      const buildBase = () => normalizeBase(proxyBase || "https://esi.evetech.net/latest");
+
+      async function fetchJSON(url) {
+        const r = await fetch(url, { headers: { "Accept": "application/json" } });
+        if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+        return r.json();
+      }
+      async function fetchWithPages(url) {
+        const r = await fetch(url, { headers: { "Accept": "application/json" } });
+        if (r.status === 404) return { data: [], pages: 1 };
+        if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+        const pages = Number(r.headers.get("X-Pages")) || 1;
+        const data = await r.json();
+        return { data, pages };
+      }
+
+      async function fetchContractsPage(regionId, page) {
+        const base = buildBase();
+        return await fetchJSON(`${base}/contracts/public/${regionId}/?page=${page}`);
+      }
+      async function fetchContractItems(cid) {
+        const base = buildBase();
+        return await fetchJSON(`${base}/contracts/public/items/${cid}/`);
+      }
+
+      async function ensureAvgMap() {
+        if (avgPriceMapRef.current) return avgPriceMapRef.current;
+        const base = buildBase();
+        const arr = await fetchJSON(`${base}/markets/prices/`);
+        const map = new Map();
+        for (const it of arr) {
+          if (it?.type_id) {
+            const v = Number(it.average_price ?? it.adjusted_price);
+            if (isFinite(v)) map.set(Number(it.type_id), v);
+          }
+        }
+        avgPriceMapRef.current = map;
+        return map;
+      }
+      async function fetchJitaBuyPrice(typeId) {
+        if (jitaBuyPriceCacheRef.current.has(typeId)) return jitaBuyPriceCacheRef.current.get(typeId);
+        const base = buildBase();
+        let best = 0;
+        const { data, pages } = await fetchWithPages(`${base}/markets/${JITA_REGION}/orders/?order_type=buy&type_id=${typeId}&page=1`);
+        for (const o of data) { const p = Number(o.price); if (isFinite(p)) best = Math.max(best, p); }
+        for (let p=2; p<=pages; p++) {
+          const { data: d } = await fetchWithPages(`${base}/markets/${JITA_REGION}/orders/?order_type=buy&type_id=${typeId}&page=${p}`);
+          for (const o of d) { const v = Number(o.price); if (isFinite(v)) best = Math.max(best, v); }
+        }
+        jitaBuyPriceCacheRef.current.set(typeId, best);
+        return best;
+      }
+      async function fetchRegionName(regionId) {
+        if (regionNameCache.has(regionId)) return regionNameCache.get(regionId);
+        const base = buildBase();
+        try {
+          const data = await fetchJSON(`${base}/universe/regions/${regionId}/`);
+          const name = data?.name || String(regionId);
+          const newMap = new Map(regionNameCache); newMap.set(regionId, name); setRegionNameCache(newMap);
+          return name;
+        } catch(e) { return String(regionId); }
+      }
+      async function fetchTypeName(typeId) {
+        const cache = typeNameCacheRef.current;
+        if (cache.has(typeId)) return cache.get(typeId);
+        const base = buildBase();
+        const data = await fetchJSON(`${base}/universe/types/${typeId}/`);
+        const name = data?.name || ""; cache.set(typeId, name); return name;
+      }
+      async function fetchCharName(charId) {
+        const cache = charNameCacheRef.current;
+        if (cache.has(charId)) return cache.get(charId);
+        const base = buildBase();
+        const data = await fetchJSON(`${base}/characters/${charId}/`);
+        const name = data?.name || String(charId); cache.set(charId, name); return name;
+      }
+      async function fetchCorpName(corpId) {
+        const cache = corpNameCacheRef.current;
+        if (cache.has(corpId)) return cache.get(corpId);
+        const base = buildBase();
+        const data = await fetchJSON(`${base}/corporations/${corpId}/`);
+        const name = data?.name || String(corpId); cache.set(corpId, name); return name;
+      }
+
+      const percent = (a,b) => (!isFinite(a)||!isFinite(b)||b===0) ? 0 : (a/b - 1)*100;
+      function parseCustomRegionIds(input) { const ids=new Set(); (input||"").split(/[^0-9]+/).forEach(x=>{ const n=Number(x); if (Number.isInteger(n)&&n>0) ids.add(n); }); return ids; }
+      function toggleRegion(id, checked) { const next=new Set(selectedRegionIds); if (checked) next.add(id); else next.delete(id); setSelectedRegionIds(next); }
+      function triggerNotify(row) {
+        const title = `高价值合同：利润 ${Math.round(row.profit).toLocaleString()} ISK`;
+        const body = [`星域：${row.region_name} (${row.region_id})`,`CID：${row.contract_id}`,`价格：${Math.round(row.price).toLocaleString()} ISK`,`估值(Jita买单)：${Math.round(row.value).toLocaleString()} ISK`,`溢价：${row.marginPct.toFixed(1)}%`].join("\\n");
+        if (useNotify && "Notification" in window) {
+          if (Notification.permission === "granted") new Notification(title, { body });
+          else if (Notification.permission !== "denied") Notification.requestPermission().then(p => { if (p==="granted") new Notification(title,{body}); });
+        }
+        if (useSound && audioRef.current) { audioRef.current.currentTime = 0; audioRef.current.play().catch(()=>{}); }
+      }
+      function maybeAlert(row) { if (row.profit >= alertProfit) { const key=String(row.contract_id); if (notifyOnce) { if (!seenAlertRef.current.has(key)) { seenAlertRef.current.add(key); triggerNotify(row); } } else triggerNotify(row); } }
+      function inRecentDays(dateStr, days) { if (!dateStr) return false; const t=Date.parse(dateStr); if (!isFinite(t)) return false; return (Date.now()-t) <= days*86400000; }
+      function inRecentMinutes(dateStr, minutes) { if (!dateStr) return false; const t=Date.parse(dateStr); if (!isFinite(t)) return false; return (Date.now()-t) <= minutes*60000; }
+
+      // —— 去重插入/更新 ——
+      function upsertRow(regionId, row) {
+        setRowsByRegion(prev => {
+          const m = new Map(prev);
+          const arr = m.get(regionId) ? [...m.get(regionId)] : [];
+          let idxMap = rowsIndexByRegionRef.current.get(regionId);
+          if (!idxMap) { idxMap = new Map(); rowsIndexByRegionRef.current.set(regionId, idxMap); }
+
+          const key = row.contract_id;
+          if (idxMap.has(key)) {
+            // 更新已有行
+            const i = idxMap.get(key);
+            arr[i] = row;
+          } else {
+            // 新增
+            idxMap.set(key, arr.length);
+            arr.push(row);
+            globalSeenCidsRef.current.add(String(key));
+          }
+          // 重新根据利润排序，并重建 index map
+          arr.sort((a,b)=> b.profit - a.profit);
+          const newIdx = new Map();
+          arr.forEach((r,i)=> newIdx.set(r.contract_id, i));
+          rowsIndexByRegionRef.current.set(regionId, newIdx);
+
+          m.set(regionId, arr);
+          return m;
+        });
+      }
+
+      // 整轮覆盖时，去重
+      function replaceRegionRows(regionId, rows) {
+        const unique = new Map();
+        for (const r of rows) unique.set(r.contract_id, r);
+        const arr = Array.from(unique.values()).sort((a,b)=> b.profit - a.profit);
+        const idx = new Map(); arr.forEach((r,i)=> idx.set(r.contract_id, i));
+        rowsIndexByRegionRef.current.set(regionId, idx);
+        setRowsByRegion(prev => { const m=new Map(prev); m.set(regionId, arr); return m; });
+        arr.forEach(r => globalSeenCidsRef.current.add(String(r.contract_id)));
+      }
+
+      // —— 两阶段估值 ——
+      async function ensureAvgMap() {
+        if (avgPriceMapRef.current) return avgPriceMapRef.current;
+        const base = buildBase();
+        const arr = await fetchJSON(`${base}/markets/prices/`);
+        const map = new Map();
+        for (const it of arr) if (it?.type_id) {
+          const v = Number(it.average_price ?? it.adjusted_price);
+          if (isFinite(v)) map.set(Number(it.type_id), v);
+        }
+        avgPriceMapRef.current = map;
+        return map;
+      }
+      async function quickEstimateValue(items) {
+        const map = await ensureAvgMap();
+        let total = 0;
+        for (const it of items) {
+          if (it?.is_included === false) continue;
+          const typeId = Number(it.type_id); const qty = Number(it.quantity ?? 1);
+          if (!typeId || qty <= 0) continue;
+          const v = map.get(typeId);
+          if (v) total += v * qty;
+        }
+        return total;
+      }
+      async function preciseValueJitaBuy(items, excludeBlueprints) {
+        let total = 0;
+        for (const it of items) {
+          if (it?.is_included === false) continue;
+          const typeId = Number(it.type_id); const qty = Number(it.quantity ?? 1);
+          if (!typeId || qty <= 0) continue;
+
+          let isBP = false;
+          if (excludeBlueprints) {
+            if (it?.is_blueprint_copy === true) isBP = true;
+            else { try { const typeName = await fetchTypeName(typeId); if (/blueprint/i.test(typeName)) isBP = true; } catch(e) {} }
+          }
+          if (isBP) continue;
+
+          const pr = await fetchJitaBuyPrice(typeId);
+          if (pr) total += pr * qty;
+        }
+        return total;
+      }
+
+      async function fetchRegionName(regionId) {
+        if (regionNameCache.has(regionId)) return regionNameCache.get(regionId);
+        const base = buildBase();
+        try {
+          const data = await fetchJSON(`${base}/universe/regions/${regionId}/`);
+          const name = data?.name || String(regionId);
+          const newMap = new Map(regionNameCache); newMap.set(regionId, name); setRegionNameCache(newMap);
+          return name;
+        } catch(e) { return String(regionId); }
+      }
+      async function fetchTypeName(typeId) {
+        const cache = typeNameCacheRef.current;
+        if (cache.has(typeId)) return cache.get(typeId);
+        const base = buildBase();
+        const data = await fetchJSON(`${base}/universe/types/${typeId}/`);
+        const name = data?.name || ""; cache.set(typeId, name); return name;
+      }
+      async function fetchCharName(charId) {
+        const cache = charNameCacheRef.current;
+        if (cache.has(charId)) return cache.get(charId);
+        const base = buildBase();
+        const data = await fetchJSON(`${base}/characters/${charId}/`);
+        const name = data?.name || String(charId); cache.set(charId, name); return name;
+      }
+      async function fetchCorpName(corpId) {
+        const cache = corpNameCacheRef.current;
+        if (cache.has(corpId)) return cache.get(corpId);
+        const base = buildBase();
+        const data = await fetchJSON(`${base}/corporations/${corpId}/`);
+        const name = data?.name || String(corpId); cache.set(corpId, name); return name;
+      }
+
+      async function scanOnce() {
+        setError("");
+        if (!instantAppend) { setRowsByRegion(new Map()); rowsIndexByRegionRef.current = new Map(); }
+        const percent = (a,b) => (!isFinite(a)||!isFinite(b)||b===0) ? 0 : (a/b - 1)*100;
+
+        const inRecentDays = (dateStr, days)=>{ if (!dateStr) return false; const t=Date.parse(dateStr); if (!isFinite(t)) return false; return (Date.now()-t)<=days*86400000; };
+        const inRecentMinutes = (dateStr, minutes)=>{ if (!dateStr) return false; const t=Date.parse(dateStr); if (!isFinite(t)) return false; return (Date.now()-t)<=minutes*60000; };
+
+        const buildBase = () => normalizeBase(proxyBase || "https://esi.evetech.net/latest");
+
+        const regionTargets = [];
+        if (scope === "single") regionTargets.push(singleRegion);
+        else {
+          const manual = new Set((customRegionInput||"").split(/[^0-9]+/).map(x=>Number(x)).filter(n=>Number.isInteger(n)&&n>0));
+          const union = new Set([...selectedRegionIds, ...manual]);
+          if (union.size === 0) { alert("请选择至少一个星域，或在自定义里填入星域ID。"); return; }
+          regionTargets.push(...union);
+        }
+
+        logPush("开始扫描...");
+
+        for (const regionId of regionTargets) {
+          const regionName = await fetchRegionName(regionId);
+          logPush(`—— 开始扫描星域：${regionName} (${regionId}) ——`);
+          if (instantAppend) setRowsByRegion(prev => { const m=new Map(prev); if (!m.has(regionId)) m.set(regionId, []); return m; });
+
+          const found = [];
+          for (let p=1; p<=scanPages; p++) {
+            const list = await fetchContractsPage(regionId, p);
+            if (!list || !list.length) break;
+
+            for (const c of list) {
+              if (c?.type !== "item_exchange") continue;
+              if (onlyRecentMinutes) { if (!inRecentMinutes(c.date_issued, recentMinutes)) continue; }
+              else if (onlyRecentDays) { if (!inRecentDays(c.date_issued, recentDays)) continue; }
+
+              const price = Number(c.price ?? 0);
+              if (price < minContractPrice) continue;
+
+              let items = [];
+              try { items = await fetchContractItems(c.contract_id); }
+              catch(e) { logPush(`[${regionName}] 合同 ${c.contract_id} 明细失败：${e?.message ?? e}`); continue; }
+
+              // 两阶段
+              let value = 0;
+              if (twoStage) {
+                const est = await quickEstimateValue(items);
+                const estMarginPct = percent(est, price);
+                const estProfit = est - price;
+                const hit = (estMarginPct >= thresholdPct && estProfit >= minProfit && est >= minValue);
+                if (!hit) continue;
+                value = await preciseValueJitaBuy(items, excludeBlueprints);
+              } else {
+                value = await preciseValueJitaBuy(items, excludeBlueprints);
+              }
+
+              const marginPct = percent(value, price);
+              const profit = value - price;
+              const pass = (marginPct >= thresholdPct && profit >= minProfit && value >= minValue);
+              if (!pass) continue;
+
+              const forCorp = !!c.for_corporation;
+              let issuer_char_name = "", issuer_corp_name = "";
+              try {
+                if (forCorp && c.issuer_corporation_id) { issuer_corp_name = await fetchCorpName(c.issuer_corporation_id); if (c.issuer_id) issuer_char_name = await fetchCharName(c.issuer_id); }
+                else { if (c.issuer_id) issuer_char_name = await fetchCharName(c.issuer_id); }
+              } catch(e) {}
+
+              const row = { region_id: regionId, region_name: regionName, contract_id: c.contract_id, title: c.title || "", price, value, profit, marginPct, for_corporation: forCorp, issuer_id: c.issuer_id, issuer_corporation_id: c.issuer_corporation_id, issuer_char_name, issuer_corp_name, date_issued: c.date_issued };
+
+              if (instantAppend) { upsertRow(regionId, row); maybeAlert(row); }
+              found.push(row);
+            }
+          }
+
+          if (!instantAppend) {
+            replaceRegionRows(regionId, found);
+            found.forEach(r => maybeAlert(r));
+          }
+          logPush(`—— 结束星域：${regionName}（命中 ${found.length} 条；已去重显示）——`);
+        }
+
+        logPush("扫描完成。");
+      }
+
+      function exportCSV() {
+        try {
+          const headers = ["region_name","region_id","contract_id","title","price","value","profit","marginPct","for_corporation","issuer_id","issuer_char_name","issuer_corporation_id","issuer_corp_name","date_issued"];
+          const lines = [headers.join(",")];
+          for (const [rid, rows] of rowsByRegion.entries()) for (const r of rows) {
+            const row = [JSON.stringify(r.region_name ?? ""), r.region_id ?? "", r.contract_id ?? "", JSON.stringify(r.title ?? ""), r.price ?? "", r.value ?? "", r.profit ?? "", (typeof r.marginPct === "number" ? r.marginPct.toFixed(2) : ""), r.for_corporation ? "true" : "false", r.issuer_id ?? "", JSON.stringify(r.issuer_char_name ?? ""), r.issuer_corporation_id ?? "", JSON.stringify(r.issuer_corp_name ?? ""), JSON.stringify(r.date_issued ?? "")];
+            lines.push(row.join(","));
+          }
+          const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+          const url = URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=`eve_contracts_dedup_${Date.now()}.csv`; a.click();
+        } catch (e) { alert("导出失败：" + (e?.message || e)); }
+      }
+
+      async function testProxy() {
+        setTesting(true); setTestOk(null); setError("");
+        try { const base=normalizeBase(proxyBase || "https://esi.evetech.net/latest"); const r=await fetch(`${base}/status`, { headers: { "Accept":"application/json" } }); if (!r.ok) throw new Error("HTTP "+r.status); await r.json(); setTestOk(true); localStorage.setItem(LS_KEY, base); }
+        catch(e){ setTestOk(false); setError("测试失败：" + (e?.message || e)); }
+        finally{ setTesting(false); }
+      }
+      function startAuto(){ if (autoRun) return; setAutoRun(true); seenAlertRef.current=new Set(); scanOnce(); pollTimerRef.current=setInterval(()=>scanOnce(), Math.max(20, Number(pollSeconds))*1000); logPush(`已开始自动扫描；间隔 ${pollSeconds}s；即时显示：${instantAppend?"开":"关"}；近${onlyRecentMinutes?recentMinutes+"分钟":(onlyRecentDays?recentDays+"天":"全部")}；两阶段估值：${twoStage?"开":"关"}；价格预筛 ≥ ${minContractPrice.toLocaleString()} ISK。`); }
+      function stopAuto(){ setAutoRun(false); if (pollTimerRef.current){ clearInterval(pollTimerRef.current); pollTimerRef.current=null; } logPush("已停止自动扫描。"); }
+      useEffect(()=>()=>{ if (pollTimerRef.current) clearInterval(pollTimerRef.current); }, []);
+
+      const regionBlocks = useMemo(()=>{ const arr=[]; for (const [rid, rows] of rowsByRegion.entries()){ const name=regionNameCache.get(rid) || String(rid); arr.push({rid, name, rows}); } arr.sort((a,b)=> a.name.localeCompare(b.name)); return arr; }, [rowsByRegion, regionNameCache]);
+
+      return (
+        <div className="min-h-screen p-4 md:p-8">
+          <div className="max-w-7xl mx-auto">
+            <h1 className="text-2xl md:text-3xl font-bold mb-2">EVE 合同猎手（两阶段估值 · 近N分钟 · 价格预筛 · 去重修复）</h1>
+            <p className="text-sm text-slate-600 mb-6">修复：同一合同 <b>只显示一次</b>。即时显示与自动轮询会 <b>更新/去重</b>，按利润降序重排。</p>
+
+            <audio ref={audioRef} preload="auto" src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABYAaW1hZ2luYXJ5c291bmQAAAAA//8AAP//AAD//wAA//8AAP//AAD//wAA" />
+
+            <div className="bg-white rounded-2xl shadow p-4 mb-6">
+              <div className="grid md:grid-cols-3 gap-3 items-end">
+                <div className="md:col-span-2">
+                  <label className="block text-sm mb-1">代理基地址（例如：https://你的worker.workers.dev/latest）</label>
+                  <input className="w-full border rounded-lg p-2" placeholder="不填则直连 ESI 官方" value={proxyBase} onChange={e=>setProxyBase(e.target.value)} />
+                </div>
+                <div className="flex gap-2">
+                  <button className="px-4 py-2 rounded-xl shadow bg-slate-900 text-white" onClick={testProxy} disabled={testing}>{testing ? "测试中..." : "测试代理"}</button>
+                  <button className="px-4 py-2 rounded-xl shadow border" onClick={()=>{ localStorage.removeItem(LS_KEY); setProxyBase(""); setTestOk(null); }}>清除</button>
+                </div>
+              </div>
+              {testOk === true && <p className="text-emerald-600 text-sm mt-2">✅ 代理可用，已保存到本地。</p>}
+              {testOk === false && <p className="text-rose-600 text-sm mt-2">❌ 代理不可用：{error}</p>}
+              <label className="inline-flex items-center gap-2 mt-2"><input type="checkbox" checked={excludeBlueprints} onChange={e=>setExcludeBlueprints(e.target.checked)} />排除蓝图类物品（建议开启）</label>
+            </div>
+
+            <div className="bg-white rounded-2xl shadow p-4 mb-6">
+              <h3 className="font-semibold mb-3">扫描范围</h3>
+              <div className="flex gap-4 mb-3">
+                <label className="inline-flex items-center gap-2"><input type="radio" name="scope" checked={scope==='single'} onChange={()=>setScope('single')} /> 单一星域</label>
+                <label className="inline-flex items-center gap-2"><input type="radio" name="scope" checked={scope==='multi'} onChange={()=>setScope('multi')} /> 多星域（全宇宙）</label>
+              </div>
+              {scope === 'single' ? (
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                  <label className="col-span-2 md:col-span-1">选择星域</label>
+                  <select className="border rounded-lg p-2 col-span-2 md:col-span-2" value={singleRegion} onChange={e=>setSingleRegion(Number(e.target.value))}>
+                    {COMMON_REGIONS.map(r=> <option key={r.id} value={r.id}>{r.name} — {r.id}</option>)}
+                  </select>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-sm mb-1">常用星域（可多选）</p>
+                    <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-2">
+                      {COMMON_REGIONS.map(r => (
+                        <label key={r.id} className="inline-flex items-center gap-2">
+                          <input type="checkbox" checked={selectedRegionIds.has(r.id)} onChange={e=>toggleRegion(r.id, e.target.checked)} />{r.name} — {r.id}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-sm mb-1">自定义星域ID（逗号/空格分隔）</label>
+                    <input className="w-full border rounded-lg p-2" placeholder="例如：10000002, 10000043, 10000032" value={customRegionInput} onChange={e=>setCustomRegionInput(e.target.value)} />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-white rounded-2xl shadow p-4 mb-6">
+              <h3 className="font-semibold mb-3">过滤 / 自动提醒</h3>
+              <div className="grid md:grid-cols-2 gap-4">
+                <div className="grid grid-cols-2 gap-3">
+                  <label>最小估值（ISK，按Jita买单精算）</label>
+                  <input type="number" className="border rounded-lg p-2" value={minValue} onChange={e=>setMinValue(Number(e.target.value))}/>
+                  <label>阈值（%）</label>
+                  <input type="number" className="border rounded-lg p-2" value={thresholdPct} onChange={e=>setThresholdPct(Number(e.target.value))}/>
+                  <label>最小利润（ISK）</label>
+                  <input type="number" className="border rounded-lg p-2" value={minProfit} onChange={e=>setMinProfit(Number(e.target.value))}/>
+                  <label>每星域扫描页数</label>
+                  <input type="number" className="border rounded-lg p-2" value={scanPages} onChange={e=>setScanPages(Math.max(1, Number(e.target.value)))} />
+                  <label>合同价格预筛（ISK）</label>
+                  <input type="number" className="border rounded-lg p-2" value={minContractPrice} onChange={e=>setMinContractPrice(Number(e.target.value))} />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="col-span-2 inline-flex items-center gap-2"><input type="checkbox" checked={twoStage} onChange={e=>setTwoStage(e.target.checked)} />两阶段估值（先粗估后精算）</label>
+
+                  <label className="col-span-2 inline-flex items-center gap-2"><input type="checkbox" checked={onlyRecentMinutes} onChange={e=>setOnlyRecentMinutes(e.target.checked)} />仅扫描最近 N 分钟</label>
+                  <label>N（分钟）</label>
+                  <input type="number" className="border rounded-lg p-2" value={recentMinutes} onChange={e=>setRecentMinutes(Math.max(1, Number(e.target.value)))} />
+
+                  <label className="col-span-2 inline-flex items-center gap-2"><input type="checkbox" checked={onlyRecentDays} onChange={e=>setOnlyRecentDays(e.target.checked)} />（可选）仅扫描最近 N 天</label>
+                  <label>N（天）</label>
+                  <input type="number" className="border rounded-lg p-2" value={recentDays} onChange={e=>setRecentDays(Math.max(1, Number(e.target.value)))} />
+
+                  <label>利润提醒阈值（ISK）</label>
+                  <input type="number" className="border rounded-lg p-2" value={alertProfit} onChange={e=>setAlertProfit(Number(e.target.value))}/>
+                  <label>轮询间隔（秒）</label>
+                  <input type="number" className="border rounded-lg p-2" value={pollSeconds} onChange={e=>setPollSeconds(Math.max(20, Number(e.target.value)))} />
+                  <label className="col-span-2 inline-flex items-center gap-2"><input type="checkbox" checked={notifyOnce} onChange={e=>setNotifyOnce(e.target.checked)} />每个合同只提醒一次</label>
+                  <label className="inline-flex items-center gap-2"><input type="checkbox" checked={useNotify} onChange={e=>setUseNotify(e.target.checked)} /> 浏览器通知</label>
+                  <label className="inline-flex items-center gap-2"><input type="checkbox" checked={useSound} onChange={e=>setUseSound(e.target.checked)} /> 声音提醒</label>
+                  <label className="col-span-2 inline-flex items-center gap-2"><input type="checkbox" checked={instantAppend} onChange={e=>setInstantAppend(e.target.checked)} /> 即时显示（命中立刻加入下方表格）</label>
+                  <div className="col-span-2 flex gap-3 mt-2">
+                    {!autoRun ? (<button className="px-4 py-2 rounded-xl shadow bg-emerald-600 text-white" onClick={startAuto}>开始自动扫描</button>) : (<button className="px-4 py-2 rounded-xl shadow bg-rose-600 text-white" onClick={stopAuto}>停止自动扫描</button>)}
+                    <button className="px-4 py-2 rounded-xl shadow border" onClick={()=>scanOnce()}>手动扫描一次</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-2xl shadow p-4 mb-6">
+              <button className="px-4 py-2 rounded-xl shadow border" onclick="exportCSV">导出 CSV（当前结果）</button>
+            </div>
+
+            <div className="bg-white rounded-2xl shadow p-4 mb-6">
+              <h3 className="font-semibold mb-2">日志（含每个合同 CID）</h3>
+              <div className="h-64 overflow-auto text-xs bg-slate-50 border rounded-lg p-2">
+                {logs.map((l, i) => <div key={i} className="whitespace-pre-wrap">{l}</div>)}
+              </div>
+            </div>
+
+            {regionBlocks.map(block => (
+              <div key={block.rid} className="bg-white rounded-2xl shadow p-4 mb-6">
+                <div className="flex items-center gap-3 mb-3">
+                  <h3 className="font-semibold text-lg">{block.name} — {block.rid}（命中 {block.rows.length} 条，按利润降序）</h3>
+                </div>
+                <div className="overflow-auto">
+                  <table className="min-w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b bg-slate-50">
+                        <th className="py-2 px-2">CID</th>
+                        <th className="py-2 px-2">标题</th>
+                        <th className="py-2 px-2">价格</th>
+                        <th className="py-2 px-2">估值(Jita买单精算)</th>
+                        <th className="py-2 px-2">利润</th>
+                        <th className="py-2 px-2">溢价%</th>
+                        <th className="py-2 px-2">发布者</th>
+                        <th className="py-2 px-2">发布时间(UTC)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {block.rows.map(r => (
+                        <tr key={r.contract_id} className="border-b">
+                          <td className="py-2 px-2">{r.contract_id}<button className="ml-2 text-xs px-2 py-0.5 rounded border" onClick={()=>navigator.clipboard.writeText(String(r.contract_id))}>复制</button></td>
+                          <td className="py-2 px-2">{r.title || '-'}</td>
+                          <td className="py-2 px-2">{r.price?.toLocaleString?.() ?? r.price}</td>
+                          <td className="py-2 px-2">{r.value?.toLocaleString?.() ?? r.value}</td>
+                          <td className="py-2 px-2 font-medium">{r.profit?.toLocaleString?.() ?? r.profit}</td>
+                          <td className="py-2 px-2">{(r.marginPct?.toFixed?.(1)) ?? 0}%</td>
+                          <td className="py-2 px-2">
+                            {r.for_corporation ? (
+                              <div className="space-y-1">
+                                <div>公司：{r.issuer_corp_name || r.issuer_corporation_id}{r.issuer_corp_name ? ` (${r.issuer_corporation_id})` : ""}</div>
+                                <div className="text-xs text-slate-600">角色：{r.issuer_char_name || r.issuer_id}{r.issuer_char_name ? ` (${r.issuer_id})` : ""}</div>
+                              </div>
+                            ) : (
+                              <div>角色：{r.issuer_char_name || r.issuer_id}{r.issuer_char_name ? ` (${r.issuer_id})` : ""}</div>
+                            )}
+                          </td>
+                          <td className="py-2 px-2">{r.date_issued || "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
